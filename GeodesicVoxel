@@ -1,0 +1,1459 @@
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using Unity.Burst;
+using Unity.Collections;
+using Unity.Jobs;
+using UnityEngine;
+
+// Geodesic voxel
+public partial class BindSkin
+{
+    //const int maxSteps = 1000;
+
+    // First need to decide on a voxel resolution
+    uint mResolution = 128;//256;
+
+    const bool debugTime = false;
+
+    const bool debugShellPoints = false;
+    const bool debugNormals = false;
+    const bool debugFillPoints = false;   
+    const bool debugBoneDistance = false;
+    const int debugBone = 0;
+    const bool debugBoneVoxels = false;
+
+    // Value from 0.01-1
+    float weightInfluence = 0.7f;
+
+    // Automatically isolate appendages from eachother (if a vertex is mostly influenced by an appendage (ie finger)
+    // prevent other appendages (ie other fingers) from influencing that vertex)
+    bool isolateAppendages = false;
+
+    // Debug:
+    // Create list of points so that we can visualize the voxels
+    List<Vector3> points = new List<Vector3>(0);
+    List<float> colors = new List<float>(0);
+    // Profiling
+    double voxelShellTime, voxelFillTime, boneDistanceTime, weightsTime;
+
+    protected void GeodesicVoxel()
+    {
+        int numBones = mSkeletonComponent.skeleton.bones.Count;
+
+        // Debug time        
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        Chat.Log("Binding skin...");
+
+        if (mModel.boundsDirty)
+            new CalculateBounds(mModel).Execute();
+
+        // Create the bounds for the voxel grid. Copy the model's bounds first.
+        var bounds = new Victoria.Bounds(mModel.bounds);
+        // Add the skeleton to the bounds
+        foreach (var bone in mSkeletonComponent.skeleton.bones)
+            bounds.AddPosition(bone.pos);
+
+        // Get the model bounds extents
+        var extents = bounds.GetExtents();
+        if (extents == Vector3.zero) return;
+        ///Debug.Log("Extents: " + extents.x.ToString("F2") + " x " + extents.y.ToString("F2") + " x " + extents.z.ToString("F2"));// with " + voxelsLength + " voxels");
+
+        float resolution = mResolution;
+        float voxelsPerUnit = 1.0f / Mathf.Max(Mathf.Max(Mathf.Ceil(extents.x) / resolution, Mathf.Ceil(extents.y) / resolution), Mathf.Ceil(extents.z) / resolution);
+
+        // Need to make the bounds positive for indexing
+        var offset = new Vector3(
+            Mathf.Abs(Mathf.Min(0, bounds.min.x) * voxelsPerUnit),
+            Mathf.Abs(Mathf.Min(0, bounds.min.y) * voxelsPerUnit),
+            Mathf.Abs(Mathf.Min(0, bounds.min.z) * voxelsPerUnit));
+
+        // Create the voxel grid (3d flattened array) (add one for buffer room, so we can detect leaks easier)
+        var dims = Vector3Int.zero;
+        for (int i = 0; i < 3; i++)
+            dims[i] = Mathf.CeilToInt(extents[i] * voxelsPerUnit) + 1;
+        int voxelsLength = dims[0] * dims[1] * dims[2];
+        //Debug.Log("Voxel grid dimensions: " + dims[0] + " x " + dims[1] + " x " + dims[2]);
+
+        // Create the voxels BitArray
+        var voxels = new NativeBitArray(voxelsLength, Allocator.TempJob);// new BitArray(voxelsLength);
+        // Track which voxel each vertex lies in
+        var vertexVoxels = new NativeArray<int>(mModel.meshData.stream.Length, Allocator.TempJob, NativeArrayOptions.UninitializedMemory);
+
+        GenerateVoxels(voxels, voxelsLength, dims, offset, voxelsPerUnit, vertexVoxels);
+        //GenerateVoxelsSimple(voxels, voxelsLength, dims, offset, voxelsPerUnit, vertexVoxels);
+
+        // Create a flattened array (one voxel grid for each bone
+        var distancesToBones = new NativeArray<int>(numBones * voxelsLength, Allocator.TempJob, NativeArrayOptions.UninitializedMemory);       
+
+        ComputeDistances(voxels, distancesToBones, dims, offset, voxelsPerUnit);               
+
+        ApplyWeights(voxels, distancesToBones, numBones, dims, offset, voxelsPerUnit, vertexVoxels);
+
+        
+        // Get total time
+        double totalTime = sw.ElapsedMilliseconds;
+        // Debugging
+        if(debugTime)
+        {
+            Debug.Log("Finished skinning in: <color=white>" + totalTime + " ms</color>");
+
+            // Output the time percent of each step
+            var voxelShellPercent = voxelShellTime / totalTime * 100;
+            Debug.Log("TrianglesToVoxels: <color=" + PercentToColor(voxelShellPercent) + ">" + voxelShellPercent.ToString("F1") + "% </color>");
+
+            var voxelFillPercent = voxelFillTime / totalTime * 100;
+            Debug.Log("Voxel Fill: <color=" + PercentToColor(voxelFillPercent) + ">" + voxelFillPercent.ToString("F1") + "% </color>");
+
+            var boneDistancePercent = boneDistanceTime / totalTime * 100;
+            Debug.Log("ComputeDistances: <color=" + PercentToColor(boneDistancePercent) + ">" + boneDistancePercent.ToString("F1") + "% </color>");
+
+            var weightsPercent = weightsTime / totalTime * 100;
+            if(weightsPercent > 0.1f)
+                Debug.Log("ApplyWeights: <color=" + PercentToColor(weightsPercent) + ">" + weightsPercent.ToString("F1") + "% </color>");
+
+            string PercentToColor(double inPercent)
+            {
+                if (inPercent > 50)
+                    return "red";
+                else  if (inPercent > 40)
+                    return "orange";
+                else if (inPercent > 30)
+                    return "yellow";
+                else if (inPercent > 20)
+                    return "silver";
+                return "grey";
+            }
+        }
+        Chat.Log("Finished in " + totalTime + " ms");
+
+        // Debug visualize
+        if (debugBoneDistance)
+        {
+            // specific bone:
+            int boneIndex = debugBone;
+            int boneOffset = boneIndex * voxelsLength;
+            int lengthXY = dims.x * dims.y;
+            for (int Y = 0; Y < dims.y; Y++)
+            {
+                for (int Z = 0; Z < dims.z; Z++)
+                {
+                    int voxelIndex = Z * lengthXY + Y * dims.x;
+
+                    for (int X = 0; X < dims.x; X++)
+                    {
+                        // Read the voxel. If there's a voxel and the normal is negative, start filling.
+                        if (voxels.IsSet(voxelIndex))
+                        //if(distances[flatIndex] == 0)
+                        {
+                            points.Add(new Vector3(
+                                (X - offset.x) / voxelsPerUnit,
+                                (Y - offset.y) / voxelsPerUnit,
+                                (Z - offset.z) / voxelsPerUnit));
+                            colors.Add(Mathf.Clamp01(1.0f - (float)distancesToBones[boneOffset + voxelIndex] / mResolution));
+                        }
+
+                        // Continue forward
+                        voxelIndex++;
+                    }
+                }
+            }
+        }
+        if (debugShellPoints || debugFillPoints || debugNormals || debugBoneDistance || debugBoneVoxels)
+        {
+            if (debugFillPoints)
+            {
+                // Debug fill points:
+                int lengthXY = dims.x * dims.y;
+                for (int Y = 0; Y < dims.y; Y++)
+                {
+                    for (int Z = 0; Z < dims.z; Z++)
+                    {
+                        int flatIndex = Z * lengthXY + Y * dims.x;
+
+                        for (int X = 0; X < dims.x; X++)
+                        {
+                            // Read the voxel
+                            if (voxels.IsSet(flatIndex))
+                            {
+                                points.Add(new Vector3(
+                                    (X - offset.x) / voxelsPerUnit,
+                                    (Y - offset.y) / voxelsPerUnit,
+                                    (Z - offset.z) / voxelsPerUnit));
+                                colors.Add(0.5f);
+                            }
+
+                            // Continue forward
+                            flatIndex++;
+                        }
+                    }
+                }
+            }
+            Experiment.Instance.StartCoroutine(WaitForRenderPipeline());
+            IEnumerator WaitForRenderPipeline()
+            {
+                while (Experiment.Instance.cameraRenderer == null)
+                {
+                    yield return null;
+                }
+                //Debug.Log("Displaying " + string.Format("{0:n0}", points.Count) + " points");
+                Experiment.Instance.cameraRenderer.DebugDisplayPoints(points, colors);
+            }
+        }
+
+        // Dispose
+        voxels.Dispose();
+        vertexVoxels.Dispose();
+        distancesToBones.Dispose();        
+
+        // test
+        //mModel.PublishMesh();
+    }
+
+    private void GenerateVoxels(NativeBitArray voxels, int voxelsLength, Vector3Int dims, Vector3 offset, float voxelsPerUnit, NativeArray<int> vertexVoxels)
+    {
+        // Save the sign of each component of the normal at each location (<=0 = 0, >0 = 1)
+        //var normalsXStart = new NativeArray<bool>(voxelsLength, Allocator.TempJob, NativeArrayOptions.UninitializedMemory);
+        //var normalsXStop = new NativeArray<bool>(voxelsLength, Allocator.TempJob, NativeArrayOptions.UninitializedMemory);
+        var normalsX = new NativeBitArray(voxelsLength, Allocator.TempJob, NativeArrayOptions.UninitializedMemory);
+        var normalsY = new NativeBitArray(voxelsLength, Allocator.TempJob, NativeArrayOptions.UninitializedMemory);
+        var normalsZ = new NativeBitArray(voxelsLength, Allocator.TempJob, NativeArrayOptions.UninitializedMemory);
+       
+        int lengthX = dims.x;
+        int lengthY = dims.y;
+        int lengthZ = dims.z;
+        // premultiply lengthX * lengthY for indexing efficiency
+        int lengthXY = dims.x * dims.y;
+
+        // Generate the shell
+        {
+            var voxelsSW = System.Diagnostics.Stopwatch.StartNew();
+
+            // Initialize voxels to 0
+            for (int i = 0; i < voxelsLength; i++)
+                voxels.Set(i, false);
+
+            var jobData = new TrianglesToVoxelsJob()
+            {
+                // Input
+                vertices = mModel.meshData.stream,
+                triangleIndices = mModel.meshData.triangleIndicies,
+
+                voxelsLength = voxelsLength,
+                voxelsPerUnit = voxelsPerUnit,
+                offset = offset,
+                dims = dims,
+                lengthX = lengthX,
+                lengthXY = lengthXY,
+
+                // Output
+                voxels = voxels,
+                vertexVoxels = vertexVoxels,
+                //normalsXStart = normalsXStart,
+                //normalsXStop = normalsXStop,
+                normalsX = normalsX,
+                normalsY = normalsY,
+                normalsZ = normalsZ
+            };
+            // Execute a job for every triangle
+            var handle = jobData.Schedule(mModel.meshData.triangleIndicies.Length / 3, 1);
+            handle.Complete();
+
+            voxelShellTime = voxelsSW.ElapsedMilliseconds;
+
+            // Debug
+            if (debugShellPoints)
+            {
+                for (int X = 0; X < lengthX; X++)
+                {
+                    for (int Y = 0; Y < lengthY; Y++)
+                    {
+                        for (int Z = 0; Z < lengthZ; Z++)
+                        {
+                            int flatIndex = Z * lengthXY + Y * lengthX + X;
+
+                            if (voxels.IsSet(flatIndex))
+                            {
+                                if (debugShellPoints)
+                                {
+                                    // Visualize the voxel (need to subtract offset and divide by resolution)
+                                    points.Add(new Vector3(
+                                        (X - offset.x) / voxelsPerUnit,
+                                        (Y - offset.y) / voxelsPerUnit,
+                                        (Z - offset.z) / voxelsPerUnit));
+                                    colors.Add(1.0f);
+                                    //colors.Add(normalSignY ? 1.0f : 0.0f); // debug normals
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Debug normals points:
+        if (debugNormals)
+        {
+            for (int Y = 0; Y < dims.y; Y++)
+            {
+                for (int Z = 0; Z < dims.z; Z++)
+                {
+                    int flatIndex = Z * lengthXY + Y * dims.x;
+
+                    for (int X = 0; X < dims.x; X++)
+                    {
+                        // Read the voxel
+                        if (voxels.IsSet(flatIndex))
+                        {
+                            points.Add(new Vector3(
+                                (X - offset.x) / voxelsPerUnit,
+                                (Y - offset.y) / voxelsPerUnit,
+                                (Z - offset.z) / voxelsPerUnit));
+                            colors.Add(normalsX.IsSet(flatIndex) ? 0.0f : 1.0f);
+                        }
+
+                        // Continue forward
+                        flatIndex++;
+                    }
+                }
+            }
+        }
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+
+        // Now scanline fill the shell
+        {
+            const bool useJobs = true;
+
+            // Array creation: takes 0 ms
+            var allocator = useJobs ? Allocator.TempJob : Allocator.Temp;
+            var voxelsX = new NativeBitArray(voxelsLength, allocator, NativeArrayOptions.UninitializedMemory);
+            var voxelsY = new NativeBitArray(voxelsLength, allocator, NativeArrayOptions.UninitializedMemory);
+            var voxelsZ = new NativeBitArray(voxelsLength, allocator, NativeArrayOptions.UninitializedMemory);
+
+            const bool debugFillTime = false;
+            var currTime = sw.ElapsedMilliseconds;
+            /*if (debugFillTime)
+            {               
+                Debug.Log("Created arrays: " + currTime + " ms");
+            }*/
+         
+            if (useJobs)
+            {
+                var jobData = new ScanlineFillJob()
+                {
+                    // Input
+                    voxels = voxels,
+                    normalsX = normalsX,
+                    normalsY = normalsY,
+                    normalsZ = normalsZ,
+
+                    dims = dims,
+                    lengthX = lengthX,
+                    lengthXY = lengthXY,
+
+                    // Output
+                    voxelsX = voxelsX,
+                    voxelsY = voxelsY,
+                    voxelsZ = voxelsZ,
+                };
+                // Execute a job for each scan direction (3)
+                var handle = jobData.Schedule(3, 1);
+                handle.Complete();
+
+                if (debugFillTime)
+                {
+                    Debug.Log("ScanlineFillJob: " + (sw.ElapsedMilliseconds - currTime) + " ms");
+                    currTime = sw.ElapsedMilliseconds;
+                }
+
+                int numThreads = Mathf.Max(1, SystemInfo.processorCount - 1);
+                int workSize = voxelsLength / numThreads;
+
+                if (voxelsLength / numThreads > 0) numThreads += 1;
+
+                var combineJobData = new VoxelCombineJob()
+                {
+                    // Input
+                    voxelsX = voxelsX,
+                    voxelsY = voxelsY,
+                    voxelsZ = voxelsZ,
+
+                    numThreads = numThreads,
+                    workSize = workSize,
+                    dims = dims,
+                    lengthX = lengthX,
+                    lengthXY = lengthXY,                   
+
+                    // Output
+                    voxels = voxels,
+                };
+                // Execute a job for each scan direction (3)
+                handle = combineJobData.Schedule(numThreads, 1);
+                handle.Complete();
+                
+
+                if (debugFillTime)
+                {
+                    Debug.Log("CombineJob: " + (sw.ElapsedMilliseconds - currTime) + " ms");
+                }
+            }
+            else
+            { 
+                // X dimension
+                for (int Y = 0; Y < lengthY; Y++)
+                {
+                    for (int Z = 0; Z < lengthZ; Z++)
+                    {
+                        int scanLineStartIndex = Z * lengthXY + Y * lengthX;
+                        int flatIndex = scanLineStartIndex;
+                        bool isFilling = false;
+
+                        for (int X = 0; X < lengthX; X++)
+                        {
+                            // Read the voxel. If there's a voxel and the normal is negative, start filling.
+                            if (voxels.IsSet(flatIndex))
+                                isFilling = normalsX.IsSet(flatIndex);
+
+                            // Fill the voxel
+                            voxelsX.Set(flatIndex, isFilling);
+
+                            // Continue forward
+                            flatIndex++;
+                        }
+                    }
+                }
+                /*{
+                    int flatIndex = 0;
+                    for (int Y = 0; Y < lengthY; Y++)
+                    {
+                        for (int Z = 0; Z < lengthZ; Z++)
+                        {
+                            //int scanLineStartIndex = Z * lengthXY + Y * lengthX;
+                            //int flatIndex = scanLineStartIndex;
+                            int scanLineStartIndex = flatIndex;
+
+                            // Are we currently filling voxels?
+                            bool isFilling = false;
+
+                            for (int X = 0; X < lengthX; X++)
+                            {
+                                // Read the voxel. If there's a voxel and the normal is negative, start filling.
+                                if (voxels[flatIndex] == true)
+                                {
+                                    if (normalsXStart[flatIndex] == true)
+                                    {
+                                        // If we're already filling and we hit a SECOND start voxel, that's a clue that we found a leak and we need to patch it up.
+                                        if (isFilling)
+                                        {
+                                            // Found a leak
+                                            PlugLeak(scanLineStartIndex, flatIndex);
+                                            //Debug.Log("Found leak");
+                                        }
+
+                                        isFilling = true;
+                                    }
+                                    else if (normalsXStop[flatIndex] == true)
+                                    {
+                                        isFilling = false;
+                                    }
+                                }
+
+                                // Fill the voxel
+                                if (isFilling)
+                                {
+                                    voxelsX[flatIndex] = true;
+                                }
+
+                                // Continue forward
+                                flatIndex++;
+                            }
+
+                            // If we're still filling even after reaching the border, that's a clue that we found a leak,
+                            // since we've built in 1 voxel of buffer room (no scanline should ever reach the border)
+                            if (isFilling)
+                            {
+                                PlugLeak(scanLineStartIndex, flatIndex);
+                            }
+
+                            // Patch up the leak;
+                            // Get the previous line closest to this one
+                            // TODO: instead of plugging the leak, we can just scan in multiple directions (X/Y/Z) and compile the results to a more accurate total result
+                            // (use majority result values for final results, eg. if 2/3 directions say there's a voxel there, then put a voxel there in final voxel grid)
+                            void PlugLeak(int scanLineStart, int currVoxelPos)
+                            {
+                                // Get the current line's start index
+                                int voxelStart = GetVoxelLineStart(scanLineStart, currVoxelPos);
+
+                                // Now that we have the start of the line, compare with the length of adjacent lines. 
+
+                                // Get the x component of the startIndex
+                                int voxelStartX = voxelStart - scanLineStart;
+                                int newLength;
+                                if (Z > 0)
+                                {
+                                    int prevScanLineStart = (Z - 1) * lengthXY + Y * lengthX;
+                                    newLength = GetVoxelLineLength(prevScanLineStart + voxelStartX, prevScanLineStart + lengthX);
+                                }
+                                else if (Y > 0)
+                                {
+                                    int prevScanLineStart = Z * lengthXY + (Y - 1) * lengthX;
+                                    newLength = GetVoxelLineLength(prevScanLineStart + voxelStartX, prevScanLineStart + lengthX);
+                                }
+                                else
+                                    newLength = 0;
+
+                                // Debug
+                                {
+                                    //int currLength = currVoxelPos - voxelStart;
+                                    //Debug.Log("Current length: " + currLength);
+                                    //Debug.Log("<color=white>New length " + newLength + "</color>");
+                                    //if (currLength - newLength == 0) Debug.Log("<color=red>Removed no voxels</color>");
+                                    //Debug.Log("<color=grey>Removing " + (currLength - newLength) + " voxels</color>");
+                                }
+
+                                // Now finally clamp the line's length to the new length
+                                int newEndIndex = scanLineStart + voxelStartX + newLength;
+                                for (int index = currVoxelPos; index >= newEndIndex; index--)
+                                    // Remove the voxels
+                                    voxels[index] = false;
+
+                                int GetVoxelLineStart(int scanLineStartIndex, int currIndex)
+                                {
+                                    // travel backwards until we find the start of the fill line
+                                    for (int index = currIndex - 1; index >= scanLineStartIndex; index--)
+                                        if (voxels[index] == false)
+                                            return index;
+                                    return scanLineStartIndex;
+                                }
+
+                                // Get the flat index of the fill line's final voxel
+                                int GetVoxelLineLength(int start, int scanLineEnd)
+                                {
+                                    // Find the start of the voxel fill line
+                                    bool isCounting = false;
+                                    int voxelStart = start;
+                                    for (int index = start; index < scanLineEnd; index++)
+                                    {
+                                        // If we hit a voxel, start counting the length
+                                        if (voxels[index] == true && !isCounting)
+                                        {
+                                            isCounting = true;
+                                            voxelStart = index;
+                                        }
+                                        // If we hit a blank space, return the current length
+                                        if (voxels[index] == false && isCounting)
+                                        {
+                                            //return index - start;
+                                            return index - voxelStart;
+                                        }
+                                    }
+                                    // Default:
+                                    return 1;// scanLineEnd - start;
+                                }
+                            }
+                        }
+                    }
+                }*/
+
+                if (debugFillTime)
+                {
+                    Debug.Log("FillX: " + (sw.ElapsedMilliseconds - currTime) + " ms");
+                    currTime = sw.ElapsedMilliseconds;
+                }
+
+                // Y dimension
+                for (int X = 0; X < lengthX; X++)
+                {
+                    for (int Z = 0; Z < lengthZ; Z++)
+                    {
+                        bool isFilling = false;
+                        for (int Y = 0; Y < lengthY; Y++)
+                        {
+                            int flatIndex = Z * lengthXY + Y * lengthX + X;
+
+                            // Read the voxel. If there's a voxel and the normal is negative, start filling.
+                            if (voxels.IsSet(flatIndex))
+                                isFilling = normalsY.IsSet(flatIndex);
+
+                            // Set the voxel
+                            voxelsY.Set(flatIndex, isFilling);
+                        }
+                    }
+                }
+
+                if (debugFillTime)
+                {
+                    Debug.Log("FillY: " + (sw.ElapsedMilliseconds - currTime) + " ms");
+                    currTime = sw.ElapsedMilliseconds;
+                }
+
+                // Z dimension           
+                for (int X = 0; X < lengthX; X++)
+                {
+                    for (int Y = 0; Y < lengthY; Y++)
+                    {
+                        bool isFilling = false;
+                        for (int Z = 0; Z < lengthZ; Z++)
+                        {
+                            int flatIndex = Z * lengthXY + Y * lengthX + X;
+
+                            // Read the voxel. If there's a voxel and the normal is negative, start filling.
+                            if (voxels.IsSet(flatIndex))
+                                isFilling = normalsZ.IsSet(flatIndex);
+
+                            // Set the voxel
+                            voxelsZ.Set(flatIndex, isFilling);
+                        }
+                    }
+                }
+
+                if (debugFillTime)
+                {
+                    Debug.Log("FillZ: " + (sw.ElapsedMilliseconds - currTime) + " ms");
+                    currTime = sw.ElapsedMilliseconds;
+                }
+
+                // Now compile the results
+                for (int i = 0; i < voxelsLength; i++)
+                {
+                    // Automatically add shell voxels
+                    if (voxels.IsSet(i)) continue;
+
+                    bool X = voxelsX.IsSet(i);
+                    bool Y = voxelsY.IsSet(i);
+                    bool Z = voxelsZ.IsSet(i);
+
+                    // Majority rules (if two directions agree on a voxel, place one there)
+                    voxels.Set(i, X && Y || X && Z || Z && Y);
+                }
+
+                if (debugFillTime)
+                {
+                    Debug.Log("Combine: " + (sw.ElapsedMilliseconds - currTime) + " ms");
+                }
+            }            
+
+            // Dispose
+            voxelsX.Dispose();
+            voxelsY.Dispose();
+            voxelsZ.Dispose();
+        }
+        // Dispose
+        //normalsXStart.Dispose();
+        //normalsXStop.Dispose();
+        normalsX.Dispose();
+        normalsY.Dispose();
+        normalsZ.Dispose();
+
+        voxelFillTime = sw.ElapsedMilliseconds;
+    }
+
+    // Generate the voxel shell (triangles to voxels job)
+    [BurstCompile(CompileSynchronously = true)]
+    public struct TrianglesToVoxelsJob : IJobParallelFor
+    {
+        [ReadOnly]
+        public NativeArray<VertexData> vertices;
+        [ReadOnly]
+        public NativeArray<int> triangleIndices;
+
+        [NativeDisableParallelForRestriction]
+        public NativeBitArray voxels;
+        [NativeDisableParallelForRestriction]
+        public NativeArray<int> vertexVoxels;
+
+        /*[NativeDisableParallelForRestriction]
+        public NativeArray<bool> normalsXStart;
+        [NativeDisableParallelForRestriction]
+        public NativeArray<bool> normalsXStop;*/
+        [NativeDisableParallelForRestriction]
+        public NativeBitArray normalsX;
+        [NativeDisableParallelForRestriction]
+        public NativeBitArray normalsY;
+        [NativeDisableParallelForRestriction]
+        public NativeBitArray normalsZ;
+
+        [ReadOnly]
+        public int voxelsLength;
+        [ReadOnly]
+        public float voxelsPerUnit;
+        [ReadOnly]
+        public Vector3 offset;
+        [ReadOnly]
+        public Vector3Int dims;
+        [ReadOnly]
+        public int lengthX;
+        [ReadOnly]
+        public int lengthXY;
+
+        int to1D(Vector3 p)
+        {
+            return (int)(p.z * lengthXY + p.y * lengthX + p.x);
+        }
+        static Vector3 Vector3ToInt(Vector3 p)
+        {
+            return new Vector3((int)p.x, (int)p.y, (int)p.z);
+        }
+
+        public void Execute(int id)
+        {
+            // Triangle index
+            int ti = id * 3;
+            // Get the triangle's vertices
+            int v0 = triangleIndices[ti];
+            int v1 = triangleIndices[ti + 1];
+            int v2 = triangleIndices[ti + 2];
+
+            // Multiply by resolution, and add offset to make everything positive
+            var p0 = RoundVector3ToInt(vertices[v0].position * voxelsPerUnit + offset);
+            var p1 = RoundVector3ToInt(vertices[v1].position * voxelsPerUnit + offset);
+            var p2 = RoundVector3ToInt(vertices[v2].position * voxelsPerUnit + offset);
+
+            // Save the voxel position of each vertex
+            vertexVoxels[v0] = to1D(p0);
+            vertexVoxels[v1] = to1D(p1);
+            vertexVoxels[v2] = to1D(p2);          
+
+            // Save the sign of the x component of the normal
+            Vector3 normal = Vector3.Cross(p2 - p0, p1 - p0).normalized;
+            bool normalSignX = normal.x > 0;
+            bool normalSignY = normal.y > 0;
+            bool normalSignZ = normal.z > 0;
+
+            // Generate "start points" for "left edge"
+            var dv = p2 - p0;
+            var steps = GetSteps(dv);
+            var startPoints = new NativeArray<Vector3>(steps, Allocator.Temp, NativeArrayOptions.UninitializedMemory);
+            var step = dv / (float)steps;
+            var pos = p0;
+            for (int k = 0; k < steps; k++)
+            {
+                startPoints[k] = Vector3ToInt(pos);
+                pos += step;
+            }
+
+            // Generate "end points" for "right edge"
+            dv = p2 - p1;
+            steps = GetSteps(dv);
+            var endPoints = new NativeArray<Vector3>(steps, Allocator.Temp, NativeArrayOptions.UninitializedMemory);
+            step = dv / (float)steps;
+            pos = p1;
+            for (int k = 0; k < steps; k++)
+            {
+                endPoints[k] = Vector3ToInt(pos);
+                pos += step;
+            }
+
+            // Now go from each start point to each end point (until we run out of one)
+            int lineSteps = Mathf.Min(startPoints.Length, endPoints.Length);
+            for (int j = 0; j < lineSteps; j++)
+            {
+                dv = endPoints[j] - startPoints[j];
+                // calculate steps required for generating voxels
+                steps = GetSteps(dv);
+                step = dv / (float)steps;
+                pos = startPoints[j];
+                for (int k = 0; k <= steps; k++)
+                {
+                    int X = (int)pos.x;
+                    int Y = (int)pos.y;
+                    int Z = (int)pos.z;
+
+                    // Set the voxel
+                    int flatIndex = Z * lengthXY + Y * lengthX + X;
+                    // Range check
+                    if (flatIndex < voxelsLength)
+                    {
+                        // Set a voxel
+                        voxels.Set(flatIndex, true);
+
+                        // Save the normal sign for each direction (for scanline filling)
+                        normalsX.Set(flatIndex, normalSignX);
+                        normalsY.Set(flatIndex, normalSignY);
+                        normalsZ.Set(flatIndex, normalSignZ);
+                    }
+                    pos += step;
+                }
+            }
+            startPoints.Dispose();
+            endPoints.Dispose();
+        }
+    }
+
+    // Scanline fill in 3 dimensions
+    [BurstCompile(CompileSynchronously = true)]
+    public struct ScanlineFillJob : IJobParallelFor
+    {
+        [ReadOnly]
+        public NativeBitArray voxels;
+        [ReadOnly]
+        public NativeBitArray normalsX;
+        [ReadOnly]
+        public NativeBitArray normalsY;
+        [ReadOnly]
+        public NativeBitArray normalsZ;
+
+        // Output: 3 voxel grids
+        [NativeDisableParallelForRestriction]
+        public NativeBitArray voxelsX;
+        [NativeDisableParallelForRestriction]
+        public NativeBitArray voxelsY;
+        [NativeDisableParallelForRestriction]
+        public NativeBitArray voxelsZ;    
+
+        [ReadOnly]
+        public Vector3Int dims;
+        [ReadOnly]
+        public int lengthX;
+        [ReadOnly]
+        public int lengthXY;
+
+        public void Execute(int id)
+        {
+            if(id == 0)
+            {
+                // X dimension
+                for (int Y = 0; Y < dims.y; Y++)
+                {
+                    for (int Z = 0; Z < dims.z; Z++)
+                    {
+                        int scanLineStartIndex = Z * lengthXY + Y * lengthX;
+                        int flatIndex = scanLineStartIndex;
+                        bool isFilling = false;
+
+                        for (int X = 0; X < lengthX; X++)
+                        {
+                            // Read the voxel. If there's a voxel and the normal is negative, start filling.
+                            if (voxels.IsSet(flatIndex))
+                                isFilling = normalsX.IsSet(flatIndex);
+
+                            // Fill the voxel
+                            voxelsX.Set(flatIndex, isFilling);
+
+                            // Continue forward
+                            flatIndex++;
+                        }
+                    }
+                }
+            }
+            else if(id == 1)
+            {
+                // Y dimension
+                for (int X = 0; X < dims.x; X++)
+                {
+                    for (int Z = 0; Z < dims.z; Z++)
+                    {
+                        bool isFilling = false;
+                        for (int Y = 0; Y < dims.y; Y++)
+                        {
+                            int flatIndex = Z * lengthXY + Y * lengthX + X;
+
+                            // Read the voxel. If there's a voxel and the normal is negative, start filling.
+                            if (voxels.IsSet(flatIndex))
+                                isFilling = normalsY.IsSet(flatIndex);
+
+                            // Set the voxel
+                            voxelsY.Set(flatIndex, isFilling);
+                        }
+                    }
+                }
+                
+            }
+            else if(id == 2)
+            {
+                // Z dimension           
+                for (int X = 0; X < dims.x; X++)
+                {
+                    for (int Y = 0; Y < dims.y; Y++)
+                    {
+                        bool isFilling = false;
+                        for (int Z = 0; Z < dims.z; Z++)
+                        {
+                            int flatIndex = Z * lengthXY + Y * lengthX + X;
+
+                            // Read the voxel. If there's a voxel and the normal is negative, start filling.
+                            if (voxels.IsSet(flatIndex))
+                                isFilling = normalsZ.IsSet(flatIndex);
+
+                            // Set the voxel
+                            voxelsZ.Set(flatIndex, isFilling);
+                        }
+                    }
+                }
+            }
+            
+        }
+    }
+
+    // Scanline fill in 3 dimensions
+    [BurstCompile(CompileSynchronously = true)]
+    public struct VoxelCombineJob : IJobParallelFor
+    {
+        [ReadOnly]
+        public NativeBitArray voxelsX;
+        [ReadOnly]
+        public NativeBitArray voxelsY;
+        [ReadOnly]
+        public NativeBitArray voxelsZ;
+
+        // Output: 1 voxel grid, combining the 3 input voxel grids
+        [NativeDisableParallelForRestriction]
+        public NativeBitArray voxels;
+
+        [ReadOnly]
+        public int numThreads;
+        [ReadOnly]
+        public int workSize;
+        [ReadOnly]
+        public Vector3Int dims;
+        [ReadOnly]
+        public int lengthX;
+        [ReadOnly]
+        public int lengthXY;
+
+        public void Execute(int id)
+        {
+            int startIndex = id * workSize;
+            int endIndex = id * workSize + workSize;
+
+            // If this is the final thread, do a range check
+            if(id == numThreads - 1)
+            {
+                for (int i = startIndex; i < endIndex; i++)
+                {
+                    if (i >= voxels.Length) return;
+
+                    // Automatically add shell voxels
+                    if (voxels.IsSet(i)) continue;
+
+                    bool X = voxelsX.IsSet(i);
+                    bool Y = voxelsY.IsSet(i);
+                    bool Z = voxelsZ.IsSet(i);
+
+                    // Majority rules (if two directions agree on a voxel, place one there)
+                    voxels.Set(i, X && Y || X && Z || Z && Y);
+                }
+            }
+            else
+            {
+                // Now compile the results
+                for (int i = startIndex; i < endIndex; i++)
+                {
+                    // Automatically add shell voxels
+                    if (voxels.IsSet(i)) continue;
+
+                    bool X = voxelsX.IsSet(i);
+                    bool Y = voxelsY.IsSet(i);
+                    bool Z = voxelsZ.IsSet(i);
+
+                    // Majority rules (if two directions agree on a voxel, place one there)
+                    voxels.Set(i, X && Y || X && Z || Z && Y);
+                }
+            }            
+        }
+    }
+
+    private void ComputeDistances(NativeBitArray voxels, NativeArray<int> distancesPerBone, Vector3Int dims, Vector3 offset, float voxelsPerUnit)
+    {
+        var boneDistanceSW = System.Diagnostics.Stopwatch.StartNew();
+
+        int voxelsLength = voxels.Length;
+        int lengthX = dims.x;       
+        int lengthXY = dims.x * dims.y;
+        var skeleton = mSkeletonComponent.skeleton;
+        var bones = skeleton.bones;
+        //int maxSteps = (int)(mResolution * Mathf.Sqrt(2));
+        
+        // NativeQueue problems seem to be causing crashes
+        const bool useJobs = true;
+
+        if (!useJobs)
+        {
+            // Initialize each non-exterior voxel to infinity
+            for (int i = 0; i < distancesPerBone.Length; i++)
+            {
+                distancesPerBone[i] = int.MaxValue;//float.MaxValue;
+            }
+
+            // The start index in the distancesPerBone array that we're working with for each bone
+            int boneOffset = 0;
+            for (int i = 0; i < bones.Count; i++)
+            {
+                // voxel queue
+                var queue = new Queue<int>();
+
+                // Identify all voxels intersecting the bone
+                // Let's just rasterize the lines from the bone to each of its children
+                var bonePos = RoundVector3ToInt(bones[i].pos * voxelsPerUnit + offset);
+
+                // If the bone has no children, just set a single bone voxel
+                if (bones[i].childCount == 0)
+                {
+                    int flatIndex = (int)bonePos.z * lengthXY + (int)bonePos.y * lengthX + (int)bonePos.x;
+                    distancesPerBone[boneOffset + flatIndex] = 0;
+                    queue.Enqueue(flatIndex);
+
+                    /*if (debugBoneVoxels && i == debugBone)
+                    {
+                        points.Add((bonePos - offset) / voxelsPerUnit);
+                        colors.Add(1.0f);
+                    }*/
+                }
+
+                // Rasterize lines from the bone to each of its children
+                foreach (var childBone in bones[i].children)
+                {
+                    var childPos = RoundVector3ToInt(childBone.pos * voxelsPerUnit + offset);
+                    var dv = childPos - bonePos;
+                    var steps = GetSteps(dv);
+                    //steps = Mathf.Clamp(maxSteps, 1, maxSteps);
+                    var step = dv / (float)steps;
+                    var pos = bonePos;
+                    for (int k = 0; k < steps; k++)
+                    {
+                        // Add boneOffset (startIndex into the distancesPerBone flattened array)
+                        int flatIndex = (int)pos.z * lengthXY + (int)pos.y * lengthX + (int)pos.x;
+                        // Set the distance to 0
+                        distancesPerBone[boneOffset + flatIndex] = 0;
+                        // Enqueue the voxel position
+                        queue.Enqueue(flatIndex);
+
+                        // Debug bone 2 
+                        if (debugBoneVoxels && i == debugBone)
+                        {
+                            points.Add((pos - offset) / voxelsPerUnit);
+                            colors.Add(1.0f);
+                        }
+
+                        pos += step;
+                    }
+                }
+                var dimsMinusOne = dims - Vector3Int.one;
+
+                // Compute geodesic distances
+                while (queue.Count != 0)
+                {
+                    // Add the bone offset (startIndex into the distancesPerBone flattened array)
+                    // Actually don't because we're saving that into the queue
+                    var voxel = queue.Dequeue();
+                    var voxelPos = to3D(voxel);
+
+                    // for each non-exterior voxel neighbor
+                    // X neighbors
+                    // Boundary checks (if we don't do this, voxel values on the bottom will get propogated to the top
+                    if (voxelPos.x < dimsMinusOne.x)
+                        CompareNeighbor(voxel + 1);
+                    if (voxelPos.x > 0)
+                        CompareNeighbor(voxel - 1);
+
+                    // Y neighbors
+                    if (voxelPos.y < dimsMinusOne.y)
+                        CompareNeighbor(voxel + lengthX);
+                    if (voxelPos.y > 0)
+                        CompareNeighbor(voxel - lengthX);
+
+                    // Z neighbors
+                    if (voxelPos.z < dimsMinusOne.z)
+                        CompareNeighbor(voxel + lengthXY);
+                    if (voxelPos.z > 0)
+                        CompareNeighbor(voxel - lengthXY);
+
+                    // int neighbor: the 1D position of the neigbor. (It's way faster to just add/subtract 1/lengthX/lengthXY  
+                    // to shift in the X/Y/Z dimensions than it is to use the more expensive to1D function)
+                    void CompareNeighbor(int neighbor)
+                    {
+                        // Range check
+                        if (neighbor >= voxels.Length || neighbor < 0) return;
+
+                        // Check that the voxel is not exterior
+                        if (!voxels.IsSet(neighbor)) return;
+
+                        int boneVoxel = boneOffset + voxel;
+                        int boneNieghbor = boneOffset + neighbor;
+
+                        // dist = distances[voxel] + Abs(voxel.pos - neighbor.pos)
+                        var dist = distancesPerBone[boneVoxel] + 1;
+
+                        if (distancesPerBone[boneNieghbor] > dist)
+                        {
+                            distancesPerBone[boneNieghbor] = dist;
+                            queue.Enqueue(neighbor);
+                        }
+                    }
+                }
+
+                // Increment boneOffset (startIndex)
+                boneOffset += voxelsLength;
+
+                Vector3 to3D(int idx)
+                {
+                    int z = idx / lengthXY;
+                    idx -= z * lengthXY;
+                    int y = idx / lengthX;
+                    int x = idx % lengthX;
+                    return new Vector3(x, y, z);
+                }
+
+                int to1D(Vector3 p)
+                {
+                    return (int)(p.z * lengthXY + p.y * lengthX + p.x);
+                }
+            }
+        }  
+        
+        if(useJobs)
+        {
+            var bonePositions = new NativeArray<Vector3>(bones.Count, Allocator.TempJob);
+            var boneChildCounts = new NativeArray<int>(bones.Count, Allocator.TempJob);
+            var boneChildrenList = new List<int>();
+            for (int i = 0; i < bones.Count; i++)
+            {
+                var bone = bones[i];
+
+                bonePositions[i] = bone.pos;
+                boneChildCounts[i] = bone.childCount;
+
+                foreach (var child in bone.children)
+                {
+                    boneChildrenList.Add(bones.IndexOf(child));
+                }
+            }            
+            var boneChildren = new NativeArray<int>(boneChildrenList.ToArray(), Allocator.TempJob);
+
+            var jobData = new ComputeBoneDistancesJob()
+            {
+                // Input
+                distancesPerBone = distancesPerBone,
+                voxels = voxels,
+                bonePositions = bonePositions,
+                boneChildCounts = boneChildCounts,
+                boneChildren = boneChildren,
+
+                voxelsLength = voxelsLength,
+                voxelsPerUnit = voxelsPerUnit,
+                offset = offset,
+                dims = dims,
+                lengthX = lengthX,
+                lengthXY = lengthXY,
+            };
+            var handle = jobData.Schedule(bones.Count, 1);
+            handle.Complete();
+            // Dispose
+            bonePositions.Dispose();
+            boneChildCounts.Dispose();
+            boneChildren.Dispose();
+        }
+
+        boneDistanceTime = boneDistanceSW.Elapsed.TotalMilliseconds;
+    }
+
+    // Creates a new voxel 3d grid (sub array inside distancesPerBone) of size voxelsLength, for each bone.
+    // And computes the distances to the bone for each voxel.
+
+    // Burst can't handle NativeQueues apparantly
+    //[BurstCompile(CompileSynchronously = true)]
+    public struct ComputeBoneDistancesJob : IJobParallelFor
+    {
+        [NativeDisableParallelForRestriction]
+        public NativeArray<int> distancesPerBone;
+        [ReadOnly]
+        public NativeBitArray voxels;
+        [ReadOnly]
+        public NativeArray<int> boneChildCounts;
+        [ReadOnly]
+        public NativeArray<int> boneChildren;
+        [ReadOnly]
+        public NativeArray<Vector3> bonePositions;
+
+        [ReadOnly]
+        public int voxelsLength;
+        [ReadOnly]
+        public float voxelsPerUnit;
+        [ReadOnly]
+        public Vector3 offset;
+        [ReadOnly]
+        public Vector3Int dims;
+        [ReadOnly]
+        public int lengthX;
+        [ReadOnly]
+        public int lengthXY;
+
+        static Vector3 to3D(int idx, int lengthX, int lengthXY)
+        {
+            int z = idx / (lengthXY);
+            idx -= z * lengthXY;
+            int y = idx / lengthX;
+            int x = idx % lengthX;
+            return new Vector3(x, y, z);
+        }
+
+        // int neighbor: the 1D position of the neigbor. (It's way faster to just add/subtract 1/lengthX/lengthXY  
+        // to shift in the X/Y/Z dimensions than it is to use the more expensive to1D function)
+        void CompareNeighbor(int boneOffset, NativeQueue<int> queue, int voxel, int neighbor)
+        {
+            // Do we need this?
+            // Range check
+            if (neighbor >= voxelsLength || neighbor < 0) return;
+
+            // Check that the voxel is not exterior
+            if (!voxels.IsSet(neighbor)) return;
+
+            int boneVoxel = boneOffset + voxel;
+            int boneNieghbor = boneOffset + neighbor;
+
+            // dist = distances[voxel] + Abs(voxel.pos - neighbor.pos)
+            var dist = distancesPerBone[boneVoxel] + 1;
+
+            if (distancesPerBone[boneNieghbor] > dist)
+            {
+                distancesPerBone[boneNieghbor] = dist;
+                queue.Enqueue(neighbor);
+            }
+        }
+
+        public void Execute(int id)
+        {
+            int boneOffset = voxelsLength * id;
+
+            // Initialize each non-exterior voxel to infinity
+            for (int i = boneOffset; i < boneOffset + voxelsLength; i++)
+            {
+                distancesPerBone[i] = int.MaxValue;
+            }
+
+            var dimsMinusOne = new Vector3Int(dims.x - 1, dims.y - 1, dims.z - 1);
+
+            // voxel queue
+            //var queue = new Queue<int>();
+            var queue = new NativeQueue<int>(Allocator.Temp);
+
+            // Identify all voxels intersecting the bone
+            // Let's just rasterize the lines from the bone to each of its children
+            var bonePos = RoundVector3ToInt(bonePositions[id] * voxelsPerUnit + offset);
+
+            // If the bone has no children, just set a single bone voxel
+            if (boneChildCounts[id] == 0)
+            {
+                int flatIndex = (int)bonePos.z * lengthXY + (int)bonePos.y * lengthX + (int)bonePos.x;
+                distancesPerBone[boneOffset + flatIndex] = 0;
+                queue.Enqueue(flatIndex);
+            }
+
+            // Rasterize lines from the bone to each of its children
+            for (int i = 0; i < boneChildCounts[id]; i++)
+            {
+                var childPos = RoundVector3ToInt(bonePositions[boneChildren[id + i]] * voxelsPerUnit + offset);
+                var dv = childPos - bonePos;
+                var steps = GetSteps(dv);
+                //steps = Mathf.Clamp(maxSteps, 1, maxSteps);
+                var step = dv / (float)steps;
+                var pos = bonePos;
+                for (int k = 0; k < steps; k++)
+                {
+                    // Add boneOffset (startIndex into the distancesPerBone flattened array)
+                    int flatIndex = (int)pos.z * lengthXY + (int)pos.y * lengthX + (int)pos.x;
+                    // Set the distance to 0
+                    distancesPerBone[boneOffset + flatIndex] = 0;
+                    // Enqueue the voxel position
+                    queue.Enqueue(flatIndex);
+
+                    pos += step;
+                }
+            }
+
+            // Compute geodesic distances
+            while (queue.Count != 0)
+            {
+                // Add the bone offset (startIndex into the distancesPerBone flattened array)
+                // Actually don't because we're saving that into the queue
+                var voxel = queue.Dequeue();
+                var voxelPos = to3D(voxel, lengthX, lengthXY);
+
+                // for each non-exterior voxel neighbor
+                // X neighbors
+                // Boundary checks (if we don't do this, voxel values on the bottom will get propogated to the top
+                if (voxelPos.x < dimsMinusOne.x)
+                    CompareNeighbor(boneOffset, queue, voxel, voxel + 1);
+                if (voxelPos.x > 0)
+                    CompareNeighbor(boneOffset, queue, voxel, voxel - 1);
+
+                // Y neighbors
+                if (voxelPos.y < dimsMinusOne.y)
+                    CompareNeighbor(boneOffset, queue, voxel, voxel + lengthX);
+                if (voxelPos.y > 0)
+                    CompareNeighbor(boneOffset, queue, voxel, voxel - lengthX);
+
+                // Z neighbors
+                if (voxelPos.z < dimsMinusOne.z)
+                    CompareNeighbor(boneOffset, queue, voxel, voxel + lengthXY);
+                if (voxelPos.z > 0)
+                    CompareNeighbor(boneOffset, queue, voxel, voxel - lengthXY);               
+            }
+            queue.Dispose();
+        }
+    }
+
+    private void ApplyWeights(NativeBitArray voxels, NativeArray<int> distancesPerBone, int numBones, Vector3Int dims, Vector3 offset, float voxelsPerUnit, NativeArray<int> vertexVoxels)
+    {
+        var applyWeightsSW = System.Diagnostics.Stopwatch.StartNew();
+
+        int voxelsLength = voxels.Length;
+        int distancesPerBoneLength = distancesPerBone.Length;
+        int lengthX = dims.x;
+        int lengthXY = dims.x * dims.y;
+        int numInfluences = Vertex.numInfluences;
+
+        // Loop over vertices
+        //var stream = mModel.meshData.stream;
+        //for (int i = 0; i < stream.Length; i++)
+        foreach(var vertex in mModel.vertices)
+        {
+            // Get the voxel position
+            //var intPos = RoundVector3ToInt(stream[i].position);
+            //var intPos = RoundVector3ToInt(vertex.pos * voxelsPerUnit + offset);
+            //int voxel = (int)(intPos.x * lengthXY + intPos.y * lengthX + intPos.x);
+            int voxel = vertexVoxels[vertex.vertexIndicies[0]];
+
+            if (voxel >= 0 && !voxels.IsSet(voxel))
+            {
+                Debug.Log("<color=yellow>Voxel not found</color> Vertex: " + vertex.pos);
+            }
+
+            // Track the closest bones
+            var closestBones = new int[numInfluences];
+            var minDists = new int[numInfluences];
+
+            // Init to max value
+            for (int j = 0; j < minDists.Length; j++)
+                minDists[j] = int.MaxValue;
+
+            // Loop over all bone distances at this voxel
+            int boneOffset = 0;
+            for (int j = 0; j < numBones; j++)
+            {
+                int boneVoxel = boneOffset + voxel;
+
+                // Range check
+                if(boneVoxel < distancesPerBoneLength)
+                {
+                    var boneDistance = distancesPerBone[boneVoxel];
+
+                    // Compare with distance to other bones 
+                    for (int k = 0; k < numInfluences; k++)
+                    {
+                        if (boneDistance < minDists[k])
+                        {
+                            minDists[k] = boneDistance;
+                            closestBones[k] = j;
+                            // Break so that we don't replace all the values
+                            break;
+                        }
+                    }
+                }
+
+                boneOffset += voxelsLength;
+            }
+
+            // Use 
+            if(isolateAppendages)
+            {
+                var bones = mSkeletonComponent.skeleton.bones;
+                // Is the closest bone an appendage? 
+                bool isAppendage = false;
+
+                // Go up the chain until we find a bone that isn't an appendage (ie. hip bone, hand bone, chest bone)
+                var bone = bones[closestBones[0]];
+                var currBone = bone;
+                var endBone = bone;
+                while(currBone.parent != null)
+                {
+                    currBone = currBone.parent;
+
+                    if(currBone.childCount > 1)
+                    {
+                        endBone = currBone;
+                        isAppendage = true;
+                    }
+                }
+
+                // If it is an appendage, we don't want any influence from anything other than 
+                if(isAppendage)
+                {
+                    // Get the boneIndices of each bone that's part of this appendage,
+                    // So that we know which bones influences are allowed on this vertex
+                    var appendageHash = new HashSet<int>();
+                    currBone = bone;
+                    while (currBone != null)
+                    {
+                        appendageHash.Add(currBone.GetIndex());
+                        currBone = currBone.parent;
+                        if (currBone == endBone)
+                            break;
+                    }
+
+                    // Now disallow any bone that isn't part of this appendage
+                    for (int i = 0; i < vertex.boneIndices.Length; i++)
+                    {
+                        // If the bone isn't allowed, set the weight to 0
+                        if (!appendageHash.Contains(vertex.boneIndices[i]))
+                        {
+                            vertex.weights[i] = 0;
+                        }
+                    }
+                }
+            }
+
+            //Debug.Log("Bones: " + vertex)
+            vertex.boneIndices = closestBones;
+            float resolution = mResolution;
+            for (int i = 0; i < numInfluences; i++)
+            {
+                // Make the weight independent of resolution
+                float weight = minDists[i] / resolution;
+
+                // Lerp between weight and weight^2, based on weightInfluence
+                float factor = 1.0f / Mathf.Lerp(weight, weight * weight, weightInfluence);
+                // Square
+                vertex.weights[i] = factor * factor;
+
+                // Check for NaN
+                if (float.IsNaN(vertex.weights[i]))
+                    vertex.weights[i] = 0.0f;
+            }
+
+            // Finally, normalize the weights
+            vertex.NormalizeBlendWeights();
+        }
+
+        weightsTime = applyWeightsSW.ElapsedMilliseconds;
+    }
+
+    Vector3 Vector3ToInt(Vector3 p)
+    {
+        return new Vector3((int)p.x, (int)p.y, (int)p.z);
+    }
+
+    static Vector3 RoundVector3ToInt(Vector3 p)
+    {
+        return new Vector3(Mathf.RoundToInt(p.x), Mathf.RoundToInt(p.y), Mathf.RoundToInt(p.z));
+    }
+
+    private static int GetSteps(Vector3 dv)
+    {
+        if (Mathf.Abs(dv.x) > Mathf.Abs(dv.y))
+        {
+            if (Mathf.Abs(dv.x) > Mathf.Abs(dv.z))
+                return (int)Mathf.Abs(dv.x);
+            else
+                return (int)Mathf.Abs(dv.z);
+        }
+        else
+        {
+            if (Mathf.Abs(dv.y) > Mathf.Abs(dv.z))
+                return (int)Mathf.Abs(dv.y);
+            else
+                return (int)Mathf.Abs(dv.z);
+        }
+    }  
+}
