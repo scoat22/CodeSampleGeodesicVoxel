@@ -1,8 +1,6 @@
-# CodeSampleGeodesicVoxel
-Geodesic voxel code example
-![alt text](https://i.imgur.com/32Gq7xI.png)
-
+# Geodesic voxel code example
 For my 3D modeling project, I was faced with the task of "skinning" the mesh. This is a common problem in 3D modeling/animation software. I sought out to create a solution that was fast and accurate.
+![alt text](https://i.imgur.com/32Gq7xI.png)
 
 ## Code overview:
 This code skins a mesh by assigning bone indices and weights to each vertex.
