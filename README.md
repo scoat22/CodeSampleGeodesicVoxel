@@ -12,3 +12,6 @@ Finally, each voxel looks into each bone's heat map, and chooses the closest bon
 
 My process:
 Each step has both single and multi-thread versions. First I implemented single-thread versions of each step, just to make it easier to get things working. Then I re-wrote everything in a multi-threaded version, making sure to scale as much as possible so that someone with potentially thousands of threads on their machine could make full use of them. I think its important to not be afraid to rewrite code, because the first draft will never be perfect.
+
+Languages used:
+The code is written in C# for Unity (game engine). It also uses the Burst extension, which optimizes code for Assembly. 
